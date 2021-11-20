@@ -3,13 +3,13 @@
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"flag"
 	"log"
 	"os"
 	"os/signal"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -20,12 +20,19 @@ var (
 	exitfn  context.CancelFunc
 	// wait group for all service goroutines
 	exitwg sync.WaitGroup
+
+	hashcount uint64
 )
 
+const hashpool = 64
+
+// Command line parameters.
 var (
 	ncpu = runtime.NumCPU()
 	nthr = flag.Int("n", ncpu, "number of threads to start")
-	pdur = flag.String("d", "1h30m", "duration of program working (in format '1d8h15m30s')")
+	pdur = flag.Duration("d", 90*time.Minute, "duration of program working (in format '1d8h15m30s')")
+	blen = flag.Int("b", 1024, "length of random bytes block to calculate for each hash")
+	halg = flag.String("a", "sha256", "hash or signature algorithm, can be: md5, sha1, sha224, sha256, sha384, sha512, sha512/224, sha512/256, ecdsa, ed25519")
 )
 
 // WaitInterrupt returns shutdown signal was recivied and cancels some context.
@@ -55,17 +62,16 @@ func Loader(ithr int) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	var buf = make([]byte, 1024)
-	var h = sha256.New()
+	msg = make([]byte, *blen)
+	if _, err := rand.Read(msg); err != nil {
+		panic(err)
+	}
+
 	for {
-		for i := 0; i < 16; i++ {
-			if _, err = rand.Read(buf); err != nil {
-				return
-			}
-			if _, err = h.Write(buf); err != nil {
-				return
-			}
+		for i := 0; i < hashpool; i++ {
+			alg()
 		}
+		atomic.AddUint64(&hashcount, hashpool)
 
 		// check on exit signal during running
 		select {
@@ -80,17 +86,13 @@ func Loader(ithr int) {
 func Run() {
 	flag.Parse()
 
-	var err error
-	var dur time.Duration
-	if dur, err = time.ParseDuration(*pdur); err != nil {
-		log.Fatalln(err)
-		return
-	}
-	log.Printf("execution duration is %s", dur.String())
+	log.Printf("execution duration is %s", pdur.String())
 
 	// create context and wait the break
-	exitctx, exitfn = context.WithTimeout(context.Background(), dur)
+	exitctx, exitfn = context.WithTimeout(context.Background(), *pdur)
 	go WaitInterrupt(exitfn)
+
+	DetectAlg()
 
 	if *nthr > ncpu {
 		log.Printf("recieved %d threads to start, it can be used maximum %d by number of CPU cores", *nthr, ncpu)
@@ -103,7 +105,11 @@ func Run() {
 		go Loader(i)
 	}
 
+	var start = time.Now()
 	exitwg.Wait()
+	var rundur = time.Since(start)
+	log.Printf("calculated %d entities for message of %d bytes\n", hashcount, *blen)
+	log.Printf("average speed %4.f entities per second", float64(hashcount)/float64(rundur)*float64(time.Second))
 }
 
 func main() {
