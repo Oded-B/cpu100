@@ -3,6 +3,7 @@
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"flag"
 	"log"
 	"os"
@@ -34,20 +35,6 @@ var (
 	blen = flag.Int("b", 1024, "length of random bytes block to calculate for each hash")
 	halg = flag.String("a", "sha256", "hash or signature algorithm, can be: md5, sha1, sha224, sha256, sha384, sha512, sha512/224, sha512/256, ecdsa, ed25519")
 )
-
-// WaitInterrupt returns shutdown signal was recivied and cancels some context.
-func WaitInterrupt(cancel context.CancelFunc) {
-	// Make exit signal on function exit.
-	defer cancel()
-
-	var sigint = make(chan os.Signal, 1)
-	// We'll accept graceful shutdowns when quit via SIGINT (Ctrl+C) or SIGTERM (Ctrl+/)
-	// SIGKILL, SIGQUIT will not be caught.
-	signal.Notify(sigint, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
-	// Block until we receive our signal.
-	<-sigint
-	log.Println("shutting down by break")
-}
 
 // Loader makes loading on any one CPU core.
 func Loader(ithr int) {
@@ -82,18 +69,50 @@ func Loader(ithr int) {
 	}
 }
 
-// Run launches working threads.
-func Run() {
+// Init performs global data initialisation.
+func Init() {
+	log.Println("starts")
+
 	flag.Parse()
 
 	log.Printf("execution duration is %s", pdur.String())
 
 	// create context and wait the break
 	exitctx, exitfn = context.WithTimeout(context.Background(), *pdur)
-	go WaitInterrupt(exitfn)
+	go func() {
+		// Make exit signal on function exit.
+		defer exitfn()
+
+		var sigint = make(chan os.Signal, 1)
+		var sigterm = make(chan os.Signal, 1)
+		// We'll accept graceful shutdowns when quit via SIGINT (Ctrl+C) or SIGTERM (Ctrl+/)
+		// SIGKILL, SIGQUIT will not be caught.
+		signal.Notify(sigint, syscall.SIGINT)
+		signal.Notify(sigterm, syscall.SIGTERM)
+		// Block until we receive our signal.
+		select {
+		case <-exitctx.Done():
+			if errors.Is(exitctx.Err(), context.DeadlineExceeded) {
+				log.Println("shutting down by timeout")
+			} else if errors.Is(exitctx.Err(), context.Canceled) {
+				log.Println("shutting down by cancel")
+			} else {
+				log.Printf("shutting down by %s", exitctx.Err().Error())
+			}
+		case <-sigint:
+			log.Println("shutting down by break")
+		case <-sigterm:
+			log.Println("shutting down by process termination")
+		}
+		signal.Stop(sigint)
+		signal.Stop(sigterm)
+	}()
 
 	DetectAlg()
+}
 
+// Run launches working threads.
+func Run() {
 	if *nthr > ncpu {
 		log.Printf("recieved %d threads to start, it can be used maximum %d by number of CPU cores", *nthr, ncpu)
 		*nthr = ncpu
@@ -104,16 +123,24 @@ func Run() {
 		exitwg.Add(1)
 		go Loader(i)
 	}
+}
 
+// Done performs graceful network shutdown,
+// waits until all server threads will be stopped.
+func Done() {
 	var start = time.Now()
+	// wait for exit signal
+	<-exitctx.Done()
+	// wait until all server threads will be stopped.
 	exitwg.Wait()
 	var rundur = time.Since(start)
 	log.Printf("calculated %d entities for message of %d bytes\n", hashcount, *blen)
 	log.Printf("average speed %4.f entities per second", float64(hashcount)/float64(rundur)*float64(time.Second))
+	log.Println("shutting down complete.")
 }
 
 func main() {
-	log.Println("starts")
+	Init()
 	Run()
-	log.Println("done")
+	Done()
 }
